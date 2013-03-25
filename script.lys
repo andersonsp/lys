@@ -1,7 +1,21 @@
-# test script weee
-{
-  i=0;
-  do {
-    i=i+10;
-  } while( i<50 );
+# Lys is aimed to be a simple dialect of C
+# with the addition of prototypal inheritance and message passing
+# and maybe a GC
+
+
+# Lys scripting language proof of concept
+#
+
+i=1;
+
+do {
+  i=i+1;
+} while( i<50 );
+
+# we can do conditionals too
+a = i - 5;
+if( i > 50 ) c = 23; # single statement
+else {               # block statement
+  c = 42;
 }
+

@@ -1,13 +1,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <assert.h>
 #include "lys.h"
 
 /*
- * Interpreter for Lys scripting language.  The grammar of Lys in EBNF is:
+ * Interpreter for Lys scripting language.
+ * BUILD: gcc lys.c -o lys
+ * USAGE: lys file.lys
+ *
+ * The grammar of Lys in EBNF is:
  *
  *  <comments> ::= "#" ... "\n" .
- *  <program> ::= {<statement>}
+ *  <program> ::= {<statement>} .
  *  <statement> ::= "if" <paren_expr> <statement>
  *                  | "if" <paren_expr> <statement> "else" <statement>
  *                  | "while" <paren_expr> <statement>
@@ -15,13 +24,13 @@
  *                  | "{" { <statement> } "}"
  *                  | <expr> ";"
  *                  | ";" .
- *  <paren_expr> ::= "(" <expr> ")"
- *  <expr> ::= <test> | <id> "=" <expr>
- *  <test> ::= <sum> | <sum> "<" <sum>
- *  <sum> ::= <term> | <sum> "+" <term> | <sum> "-" <term>
- *  <term> ::= <id> | <int> | <paren_expr>
- *  <id> ::= "a" | "b" | "c" | "d" | ... | "z"
- *  <int> ::= <an_unsigned_decimal_integer>
+ *  <paren_expr> ::= "(" <expr> ")" .
+ *  <expr> ::= <test> | <id> "=" <expr> .
+ *  <test> ::= <sum> | <sum> "<" <sum> | <sum> ">" <sum> .
+ *  <sum> ::= <term> | <sum> "+" <term> | <sum> "-" <term> .
+ *  <term> ::= <id> | <int> | <paren_expr> .
+ *  <id> ::= "a" | "b" | "c" | "d" | ... | "z" .
+ *  <int> ::= <an_unsigned_decimal_integer> .
  */
 
 // Taken from Lua  ---- Instruction encoding for a "simple" register based VM
@@ -59,30 +68,34 @@
 #define MAXINDEXRK  (BITRK - 1)
 #define RKASK(x)  ((x) | BITRK)
 
+//
+// Object defs
+//
+typedef int Object;
 
 //
 // Lexer.
 //
-enum {
-  DO_SYM = 256,
-  ELSE_SYM,
-  IF_SYM,
-  WHILE_SYM,
-  INT,
-  ID,
-  EOI
-};
-
+enum { DO_SYM = 256, ELSE_SYM, IF_SYM, WHILE_SYM, INT, ID, EOI };
 char *words[] = { "do", "else", "if", "while", NULL };
 
 FILE* fin;
 int ch = ' ';
-int sym;
+int sym, last_sym, line = 1;
 int int_val;
 char id_name[100];
 
-void syntax_error() {
-    fprintf(stderr, "syntax error\n");
+void syntax_error( const char* str, ... ) {
+    fprintf(stderr, "Syntax error in line %d:\n", line );
+    if( !str ) exit(1);
+
+    va_list a;
+    va_start(a, str);
+
+    char msg[1024] = {0};
+    vsnprintf(msg, 1024, str, a);
+    fputs("  ", stderr);
+    fputs(msg, stderr);
     exit(1);
 }
 
@@ -92,16 +105,20 @@ void next_ch() {
 
 void next_sym() {
     again: switch (ch) {
+        case ' ': case '\t': case '\r':
+            next_ch();
+            goto again;
         case EOF: sym = EOI; break;
         case '#':
             do next_ch(); while( ch != '\n' && ch != EOF );
-        case ' ': case '\n': case '\t': case '\r':
+        case '\n':
+            line++;
             next_ch();
             goto again;
         case '{': case '}':
         case '(': case ')':
         case '+': case '-':
-        case '<':
+        case '<': case '>':
         case ';':
         case '=':
             sym = ch;
@@ -126,264 +143,285 @@ void next_sym() {
                 while( words[sym] != NULL && strcmp(words[sym], id_name) != 0 ) sym++;
                 if( words[sym] == NULL ) {
                     if( id_name[1] == '\0' ) sym = ID;
-                    else syntax_error();
+                    else syntax_error( "Invalid identifier\n" );
                 } else {
                     sym += 256;
                 }
             } else {
-                syntax_error();
+                syntax_error("Unknown token: %c\n", ch);
             }
     }
 }
 
-/*---------------------------------------------------------------------------*/
-
-/* Parser. */
-
+//
+// Parser & Compiler.
+//
 enum {
-    VAR,
-    CST,
-    ADD,
-    SUB,
-    LT,
-    SET,
-    IF1,
-    IF2,
-    WHILE,
-    DO,
-    EMPTY,
-    SEQ,
-    EXPR,
-    PROG
+    OP_HALT, OP_MOVE, OP_LOADK, OP_LOADNFT, OP_GETGLOBAL, OP_SETGLOBAL,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW, OP_UNM, OP_NOT,
+    OP_JMP, OP_JZ, OP_AND, OP_OR, OP_EQ, OP_NEQ, OP_LT, OP_LE, OP_GT, OP_GE,
+    OP_CALL, OP_RET
 };
 
-struct node {
-    int kind;
-    struct node *o1, *o2, *o3;
-    int val;
-};
-typedef struct node node;
+#define SIZEK 512
+#define SIZEC 1024*1024
 
-node *new_node(int k) {
-    node *x = (node*)malloc(sizeof(node));
-    x->kind = k;
-    return x;
+Object constants[ SIZEK ];
+uint32_t code[ SIZEC ] = {0};
+int topk = 0, topc = 0, sp = 26;
+
+static int geti() {
+    // maybe grow the size of code
+    topc++;
+    return topc-1;
 }
 
-node *paren_expr(); // forward declaration
+static int getk() {
+    // maybe grow the size of constants area
+    topk++;
+    return topk-1;
+}
 
-node *term() {  // <term> ::= <id> | <int> | <paren_expr>
-    node *x;
+static int paren_expr(); // forward declaration
+
+static int term() {  // <term> ::= <id> | <int> | <paren_expr>
+    int a = 0;
+    last_sym = sym;
     if( sym == ID ) {
-        x = new_node(VAR);
-        x->val = id_name[0]-'a';
+        a = id_name[0]-'a';
         next_sym();
     } else if( sym == INT ) {
-        x = new_node(CST);
-        x->val = int_val;
+        a = getk();
+        constants[ a ] = int_val;
         next_sym();
+        a = RKASK( a );
     } else {
-        x = paren_expr();
+        a = paren_expr( 0 ); // don't eval expression in parents ?
     }
-    return x;
+    return a;
 }
 
-node *sum() { // <sum> ::= <term> | <sum> "+" <term> | <sum> "-" <term>
-    node *t, *x = term();
+static int sum() { // <sum> ::= <term> | <sum> "+" <term> | <sum> "-" <term>
+    int i, b, c, a = term();
     while( sym == '+' || sym == '-' ) {
-        t = x;
-        x = new_node( sym == '+'?ADD:SUB );
+        b = a;
+        a = sp++;
+        i = (sym == '+' ? OP_ADD : OP_SUB);
         next_sym();
-        x->o1 = t;
-        x->o2 = term();
+        c = term();
+        last_sym = '+';
+        int x = geti();
+        code[x] = CREATE_ABC( i, a, b, c );
     }
-    return x;
+    return a;
 }
 
-node *test() { // <test> ::= <sum> | <sum> "<" <sum>
-    node *t, *x = sum();
-    if( sym == '<' ) {
-        t = x;
-        x = new_node(LT);
+static int test() { // <test> ::= <sum> | <sum> "<" <sum>
+    int i, b, c, a = sum();
+    if( sym == '<' || sym == '>' ) { // FIXME ??
+        b = a;
+        a = sp++;       //find a temporal register to store the result
+        i = ( sym == '<' ? OP_LT : OP_GT );
         next_sym();
-        x->o1 = t;
-        x->o2 = sum();
+        c = sum();
+        last_sym = '<';
+        int x = geti();
+        code[x] = CREATE_ABC( i, a, b, c );
     }
-    return x;
+    return a;
 }
 
-node *expr() {  // <expr> ::= <test> | <id> "=" <expr>
-    node *t, *x;
-    if( sym != ID ) return test();
-    x = test();
-    if( x->kind == VAR && sym == '=' ) {
-        t = x;
-        x = new_node(SET);
-        next_sym();
-        x->o1 = t; x->o2 = expr();
-    }
-    return x;
-}
-
-node *paren_expr() { // <paren_expr> ::= "(" <expr> ")"
-    node *x;
-    if( sym == '(' ) next_sym();
-    else syntax_error();
-    x = expr();
-    if( sym == ')' ) next_sym();
-    else syntax_error();
-    return x;
-}
-
-node *statement() {
-    node *t, *x;
-    if( sym == IF_SYM ) {  // "if" <paren_expr> <statement>
-        x = new_node(IF1);
-        next_sym();
-        x->o1 = paren_expr();
-        x->o2 = statement();
-        if( sym == ELSE_SYM ) { // ... "else" <statement>
-            x->kind = IF2;
+static int expr() {  // <expr> ::= <test> | <id> "=" <expr>
+    int b, a, saved_sp = sp;
+    if( sym == ID ) {
+        a = test();
+        if( last_sym == ID && sym == '=' ) {
             next_sym();
-            x->o3 = statement();
+            b = expr();
+            int x = geti();
+            code[x] = CREATE_ABC( OP_MOVE, a, b, 0 );
+        }
+    } else {
+        a = test();
+    }
+
+    sp = saved_sp;
+    return a;
+}
+
+static int paren_expr( int eval ) { // <paren_expr> ::= "(" <expr> ")"
+    int a, b;
+
+    if( sym == '(') next_sym();
+    else syntax_error( "expected '('\n" );
+    a = expr();
+
+    if( ISK(a) && eval ) {
+        int x = geti();
+        b = a;
+        a = sp++;
+        code[x] = CREATE_ABx( OP_LOADK, a, b );
+    }
+
+    if( sym == ')' ) next_sym();
+    else syntax_error( "expected ')'\n" );
+
+    return a;
+}
+
+static int statement() {
+    int x, b, c, a = 0;
+    float aux;
+    int saved_sp;
+
+    if( sym == IF_SYM ) {  // "if" <paren_expr> <statement>
+        next_sym();
+        a = paren_expr( 1 );
+        x = geti();
+        c = statement();
+        code[x] = CREATE_AsBx( OP_JZ, a, topc-x-1 );
+
+        if( sym == ELSE_SYM ) { // ... "else" <statement>
+            code[x] = CREATE_AsBx( OP_JZ, a, topc-x );
+            x = geti();
+            next_sym();
+            statement();
+            code[x] = CREATE_AsBx( OP_JMP, a, topc-x-1 );
         }
 
     } else if( sym == WHILE_SYM ) {  // "while" <paren_expr> <statement>
-        x = new_node(WHILE);
         next_sym();
-        x->o1 = paren_expr();
-        x->o2 = statement();
+        b = topc;
+        a = paren_expr( 1 );
+        c = geti();
+        statement();
+        x = geti();
+        code[x] = CREATE_AsBx( OP_JMP, 0, b-topc );
+        code[c] = CREATE_AsBx( OP_JZ, a, topc-c-1 );
 
     } else if( sym == DO_SYM ) {  // "do" <statement> "while" <paren_expr> ";"
-        x = new_node(DO);
         next_sym();
-        x->o1 = statement();
+        b = topc;
+        statement();
         if( sym == WHILE_SYM ) next_sym();
-        else syntax_error();
-        x->o2 = paren_expr();
+        else syntax_error( "expected 'while' token\n" );
+        a = paren_expr( 1 );
         if( sym == ';' ) next_sym();
-        else syntax_error();
+        else syntax_error( "expected ';'\n" );
+        x = geti();
+        code[x] = CREATE_AsBx( OP_JZ, a, 1 );
+        x = geti();
+        code[x] = CREATE_AsBx( OP_JMP, 0, b-topc );
 
     } else if( sym == ';' ) { // ";"
-        x = new_node(EMPTY);
         next_sym();
 
     } else if( sym == '{' ) {  // "{" { <statement> } "}"
-        x = new_node(EMPTY);
+        saved_sp = sp;
+
         next_sym();
-        while( sym != '}' ) {
-            t = x;
-            x = new_node( SEQ );
-            x->o1 = t;
-            x->o2 = statement();
-        }
+        while( sym != '}' ) statement();
         next_sym();
+
+        sp = saved_sp;
 
     } else { // <expr> ";"
-        x = new_node( EXPR );
-        x->o1 = expr();
+        expr();
         if( sym == ';' ) next_sym();
-        else syntax_error();
+        else syntax_error( "in expression expected ';'\n" );
     }
-    return x;
+
+    return a;
 }
 
-node *program() { // <program> ::= <statement>
-    node *x = new_node(PROG);
+static int program() { // <program> ::= <statement>
+    int a;
     next_sym();
-    x->o1 = statement();
-    if( sym != EOI ) syntax_error();
-    return x;
-}
-
-/* Code generator. */
-
-enum {
-    IFETCH,
-    ISTORE,
-    IPUSH,
-    IPOP,
-    IADD,
-    ISUB,
-    ILT,
-    JZ,
-    JNZ,
-    JMP,
-    HALT
-};
-
-typedef char code;
-code object[1000], *here = object;
-
-void g( code c ) {
-    *here++ = c;
-} /* missing overflow check */
-
-code *hole() {
-    return here++;
-}
-void fix(code *src, code *dst) {
-    *src = dst-src;
-} /* missing overflow check */
-
-void c(node *x) {
-    code *p1, *p2;
-    switch( x->kind ) {
-        case VAR  : g(IFETCH); g(x->val); break;
-        case CST  : g(IPUSH); g(x->val); break;
-        case ADD  : c(x->o1); c(x->o2); g(IADD); break;
-        case SUB  : c(x->o1); c(x->o2); g(ISUB); break;
-        case LT   : c(x->o1); c(x->o2); g(ILT); break;
-        case SET  : c(x->o2); g(ISTORE); g(x->o1->val); break;
-        case IF1  : c(x->o1); g(JZ); p1=hole(); c(x->o2); fix(p1,here); break;
-        case IF2  : c(x->o1); g(JZ); p1=hole(); c(x->o2); g(JMP); p2=hole();
-                  fix(p1,here); c(x->o3); fix(p2,here); break;
-        case WHILE: p1=here; c(x->o1); g(JZ); p2=hole(); c(x->o2);
-                  g(JMP); fix(hole(),p1); fix(p2,here); break;
-        case DO   : p1=here; c(x->o1); c(x->o2); g(JNZ); fix(hole(),p1); break;
-        case EMPTY: break;
-        case SEQ  : c(x->o1); c(x->o2); break;
-        case EXPR : c(x->o1); g(IPOP); break;
-        case PROG : c(x->o1); g(HALT); break;
-    }
+    while( sym != EOI ) a = statement();
+    if( sym != EOI ) syntax_error( "expected EOF\n" );
+    return a;
 }
 
 //
 // Virtual machine.
 //
-int globals[26];
+// Object globals[26];
+Object stack[1024];
 
+#define RKB(i) ( ISK(GETARG_B(i)) ? &constants[INDEXK(GETARG_B(i))] : &stack[GETARG_B(i)] )
+#define RKC(i) ( ISK(GETARG_C(i)) ? &constants[INDEXK(GETARG_C(i))] : &stack[GETARG_C(i)] )
+
+int ip = 0;
 void run() {
-    int stack[1000], *sp = stack;
-    code *pc = object;
-    again: switch (*pc++) {
-        case IFETCH: *sp++ = globals[*pc++];               goto again;
-        case ISTORE: globals[*pc++] = sp[-1];              goto again;
-        case IPUSH : *sp++ = *pc++;                        goto again;
-        case IPOP  : --sp;                                 goto again;
-        case IADD  : sp[-2] = sp[-2] + sp[-1]; --sp;       goto again;
-        case ISUB  : sp[-2] = sp[-2] - sp[-1]; --sp;       goto again;
-        case ILT   : sp[-2] = sp[-2] < sp[-1]; --sp;       goto again;
-        case JMP   : pc += *pc;                            goto again;
-        case JZ    : if (*--sp == 0) pc += *pc; else pc++; goto again;
-        case JNZ   : if (*--sp != 0) pc += *pc; else pc++; goto again;
-    }
+    uint32_t i, op, done = 0;
+    int a, b, c, e;       // opcode args
+    Object *rb, *rc, *ob; // we are working only with integers for now
+
+    do {
+        i = code[ ip++ ];
+        op = GET_OPCODE(i);
+        a = GETARG_A(i);
+        if( op >= OP_MOVE || op <= OP_AND ) {
+            rb = RKB(i);
+            rc = RKC(i);
+        }
+
+        switch( op ) {
+            case OP_HALT:
+                done = 1;
+                break;
+            case OP_LOADK:
+                stack[a] = constants[GETARG_Bx(i)];
+                break;
+            case OP_MOVE:
+                stack[ a ] = *rb;
+                break;
+            case OP_ADD:
+                stack[ a ] = *rb + *rc;
+                break;
+            case OP_SUB:
+                stack[ a ] = *rb - *rc;
+                break;
+            case OP_LT:
+                stack[ a ] = (*rb < *rc);
+                break;
+            case OP_GT:
+                stack[ a ] = (*rb < *rc);
+                break;
+            case OP_JMP:
+                ip += GETARG_sBx(i);
+                break;
+            case OP_JZ:
+                if( stack[ a ] == 0  )
+                    ip += GETARG_sBx(i);
+                break;
+        }
+
+    } while( !done && ip <= SIZEC );
+}
+
+void usage(){
+    printf("USAGE:\n  lys file.lys\n");
 }
 
 //
 // Main program.
 //
-int main() {
+int main( int argc, char**argv ) {
+    if( argc < 2 ) {
+        usage();
+        return 0;
+    }
+
+    fin = fopen( argv[1], "r" );
+    program();
+
     int i;
-
-    fin = fopen( "script.lys", "r" );
-    c(program());
-
-    for( i=0; i<26; i++ ) globals[i] = 0;
+    for( i=0; i<26; i++ ) stack[i] = 0;
     run();
     for( i=0; i<26; i++ ) {
-        if( globals[i] != 0 )
-            printf( "%c = %d\n", 'a'+i, globals[i] );
+        if( stack[i] != 0 )
+            printf( "%c = %d\n", 'a'+i, stack[i] );
     }
 
   return 0;
